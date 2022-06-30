@@ -23,7 +23,7 @@ class PyTest(TestCommand):
         sys.exit(errno)
 
 setup(
-    name="mylib",
+    name="D4.2",
     version="0.0.1",
     author="Wassil Sennane, Marko J. Rančić",
     license="European Union Public License 1.2",
