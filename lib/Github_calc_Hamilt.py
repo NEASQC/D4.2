@@ -4,18 +4,25 @@
 
 import numpy as np
 import pickle
-import qat.dqs.qchem.pyscf_tools as pyscf
-from pyscf import gto, scf, ao2mo, ci
+from pyscf import gto, scf, ao2mo, ci, fci
 from functools import reduce
-from qat.dqs.qchem import transform_integrals_to_new_basis
-from qat.dqs.qchem.ucc import get_active_space_hamiltonian
+from qat.fermion import ElectronicStructureHamiltonian
+from qat.fermion.chemistry.ucc import transform_integrals_to_new_basis
+from qat.fermion.chemistry.ucc import select_active_orbitals, convert_to_h_integrals, compute_active_space_integrals
 import scipy
 
 
-def ob_tb_integ(mol,m_mol):
-    """
-    Input : PySCF molecule
-    Output : one-body & two-body integrals
+def ob_tb_integ(mol : gto.mole.Mole, m_mol: scf.hf.RHF):
+    """ Computes one-body integral and two-body integral.
+
+    Input : 
+        - mol : PySCF molecule
+        - m_mol : PySCF mean-field molecule
+
+    Output : 
+        - one_body_integ : one-body integral
+        - two_body_integ : two-body integral
+
     """
     
     ########
@@ -28,28 +35,81 @@ def ob_tb_integ(mol,m_mol):
     ########
     # 2 : calculation of two_body_integral
     ########
-    
     two_body_compressed = ao2mo.kernel(mol, m_mol.mo_coeff)
     two_body_integ = ao2mo.restore(1, two_body_compressed, n_orbitals)
     two_body_integ = np.asarray(two_body_integ.transpose(0, 2, 3, 1), order='C')
 
     return one_body_integ, two_body_integ
 
-def H_with_active_space_reduction(one_body_integ, two_body_integ, mol, m_mol, nb_homo, nb_lumo):
+
+def get_active_space_hamiltonian(one_body_integrals: np.array, two_body_integrals: np.array, 
+                                 noons: list, nels: int, 
+                                 nuclear_repulsion: float, 
+                                 threshold_1: float, threshold_2: float):
+    """ Creates active space Hamiltonian, with respect to the following rule :
+            if occupation number <= 2 - threshold_1 :
+                -> orbital is frozen
+            elif occupation number < threshold_2 :
+                -> orbital is virtual
+            else:
+                -> orbital is active
+    
+    Input :
+        - one_body_integ : one-body integral
+        - two_body_integ : two-body integral
+        - noons : list of natural orbital occupation numbers
+        - nels : total number of electrons
+        - nuclear_repulsion : nuclear repulsion energy
+        - threshold_1 : threshold to determine frozen orbitals
+        - threshold_2 : threshold to determine virtual orbitals
+    
+    Output :
+        - H_active : active space Hamiltonian
+        - active_inds : list of indices of active orbitals
+        - occ_inds : list of indices of occupied orbitals
     """
-    Input : one-body & two-body integrals, PySCF molecule, number of HOMO and LUMO 
+
+    active_inds, occ_inds = select_active_orbitals(noons, nels, 
+                                                   threshold_1, threshold_2)
+    
+    c_act, Ipq_act, Ipqrs_act = compute_active_space_integrals(one_body_integrals, two_body_integrals, 
+                                                               active_inds, occ_inds)
+    
+    hpq, hpqrs = convert_to_h_integrals(Ipq_act, Ipqrs_act)
+
+    H_active = ElectronicStructureHamiltonian(hpq=hpq, hpqrs=hpqrs, 
+                                              constant_coeff = nuclear_repulsion+c_act)  
+    
+    return H_active, active_inds, occ_inds
+
+
+def H_with_active_space_reduction(one_body_integ: np.array, two_body_integ: np.array, 
+                                  mol: gto.mole.Mole, m_mol: scf.hf.RHF,
+                                  nb_homo: int, nb_lumo: int):
+    """ Creates active space Hamiltonian from number of HOMO/LUMO orbitals required.
+
+    Input : 
+        - one_body_integ : one-body integral
+        - two_body_integ : two-body integral
+        - mol : PySCF molecule
+        - m_mol : PySCF mean-field molecule
+        - nb_homo : number of frozen orbitals
+        - nb_lumo : number of virtual orbitals
+    
     Output :
         - H_active : Hamiltonian after active space reduction (orbital freezing)
-        - active_inds, occ_inds :  list of index of active/occupied orbitals
+        - active_inds : list of indices of active orbitals
+        - occ_inds :  list of indices of occupied orbitals
         - noons : list of natural-orbital occupation numbers 
         - orbital energies : list of energies of each molecular orbital
         - nels : total number of electrons
+        - eps1 : threshold to determine frozen orbitals
+        - eps2 : threshold to determine virtual orbitals
     """
     
     ########
     # 1 : preparation
     ########
-    
     nels = mol.nelectron
     nuclear_repulsion = mol.energy_nuc()
     orbital_energies = m_mol.mo_energy
@@ -61,8 +121,7 @@ def H_with_active_space_reduction(one_body_integ, two_body_integ, mol, m_mol, nb
     basis_change = np.flip(basis_change, axis=1)
     one_body_integrals, two_body_integrals = transform_integrals_to_new_basis(one_body_integ,
                                                                               two_body_integ,
-                                                                              basis_change,
-                                                                              old_version=False)
+                                                                              basis_change)
     
     
     ########
@@ -80,10 +139,12 @@ def H_with_active_space_reduction(one_body_integ, two_body_integ, mol, m_mol, nb
     else:
         eps1 = 2 - (noons[homo_min-1]+noons[homo_min])/2
     eps2 = noons[lumo_max-1]
-
-    H_active, active_inds, occ_inds = get_active_space_hamiltonian(one_body_integrals,
-                                                  two_body_integrals, 
-                                                  noons, nels, nuclear_repulsion, threshold_1 = eps1, threshold_2 = eps2)
+    
+    
+    H_active, active_inds, occ_inds = get_active_space_hamiltonian(one_body_integrals, two_body_integrals, 
+                                                                   noons, nels, 
+                                                                   nuclear_repulsion, 
+                                                                   threshold_1 = eps1, threshold_2 = eps2)
     
     return H_active, active_inds, occ_inds, noons, orbital_energies, nels, eps1, eps2
 
@@ -91,23 +152,39 @@ def H_with_active_space_reduction(one_body_integ, two_body_integ, mol, m_mol, nb
 ### Hamiltonian save ###
 ########################
 
-def save_H_into_dict(l1, save_filename, mol, m_mol, nb_homo, nb_lumo, calc_E_exact = False):
+def save_H_into_dict(l1: float, save_filename: str, 
+                     mol: gto.mole.Mole, m_mol: scf.hf.RHF, 
+                     nb_homo: int, nb_lumo: int, 
+                     calc_E_exact: bool = False):
+    """ Full method for calculating an active space Hamiltonian and saving all data in a dictionnary.
+
+    Input :
+        - l1 : varying parameter (e.g. : bond length of a molecule)
+        - save_filename : data will be saved in 'save_filename.H.pickle'
+        - mol : PySCF molecule
+        - m_mol : PySCF mean-field molecule
+        - nb_homo : number of frozen orbitals
+        - nb_lumo : number of virtual orbitals
+        - calc_E_exact : True if exact energy must be calculated
+        
+    Output : 
+        - dic_H_save : dictionnary contained in save_filename.H.pickle, with
+            * 1st key : l1 (varying parameter)
+            * 2nd key : chemical basis set of the molecule
+            * 3rd key : nb_homo (characterizes the active space reduction)
+            * 4th key : nb_lumo (characterizes the active space reduction)
+            * Then :
+                - H_active : Hamiltonian after active space reduction (orbital freezing)
+                - active_inds, occ_inds :  list of index of active/occupied orbitals
+                - noons : list of natural-orbital occupation numbers 
+                - orbital energies : list of energies of each molecular orbital
+                - nels : total number of electrons
+                - E_exact : exact ground state energy of the system, obtained with diagonalization (None if calc_E_exact == False)
     """
-    Input : l1 (varying parameter), filename for saving, PySCF molecule, number of HOMO and LUMO, choice of exact energy calculation
-    Output :
-        - dic_H_save : dictionnary contained in save_filename.pickle with
-               * 1st key : varying parameter (e.g. : bond length of a molecule)
-               * 2nd key : basis set
-               * 3rd key : nb_homo (characterizes the active space reduction)
-               * 4th key : nb_lumo (characterizes the active space reduction)
-               * Then :
-                    - H_active : Hamiltonian after active space reduction (orbital freezing)
-                    - active_inds, occ_inds :  list of index of active/occupied orbitals
-                    - noons : list of natural-orbital occupation numbers 
-                    - orbital energies : list of energies of each molecular orbital
-                    - nels : total number of electrons
-                    - E_exact : exact ground state energy of the system, obtained with diagonalization
-    """
+
+    ########
+    # 1 : search if the file already exists
+    ########
     try:
         with open(f'{save_filename}.H.pickle','rb') as f1:
             dic_H_save = pickle.load(f1)
@@ -119,18 +196,29 @@ def save_H_into_dict(l1, save_filename, mol, m_mol, nb_homo, nb_lumo, calc_E_exa
     except:
         dic_H_save[str(l1)] = {}
         
+    
+    ########
+    # 2 : calculation of one-body and two-body integrals
+    ########
     ob, tb = ob_tb_integ(mol,m_mol)
     print(f'Nb of qubits (before reduction) : {2*ob.shape[0]}')
     
-    H_active, active_inds, occ_inds, noons, orbital_energies, nels, eps1, eps2 = H_with_active_space_reduction(ob, tb, mol, m_mol, nb_homo, nb_lumo)
-    
+    ########
+    # 3 : active space selection
+    ########
+    H_active, active_inds, occ_inds, noons, orbital_energies, nels, eps1, eps2 = H_with_active_space_reduction(ob, tb, 
+                                                                                                               mol, m_mol, 
+                                                                                                               nb_homo, nb_lumo)
+
     print(f'··· nb_homo = {nb_homo} | nb_lumo = {nb_lumo}')
     print(f'··· noons = {noons}')
     print(f'··· occ_inds = {occ_inds}')
     print(f'··· active_inds = {active_inds}')
-
     print(f'Nb of qubits (after reduction) : {H_active.nbqbits}')
     
+    ########
+    # 4 : creation and/or update of dictionnary for saving
+    ########
     try:
         dic_H_save[str(l1)][mol.basis]
     except:
@@ -150,19 +238,30 @@ def save_H_into_dict(l1, save_filename, mol, m_mol, nb_homo, nb_lumo, calc_E_exa
     dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['noons'] = noons
     dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['orbital_energies'] = orbital_energies
     dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['nels'] = nels
+
+    ########
+    # 5 : Exact energy calculation if required
+    ########
     if calc_E_exact == True:
-        EIGVAL, _ = scipy.sparse.linalg.eigs(H_active.get_matrix(sparse=True))
-        E_exact = np.min(np.real(EIGVAL))
-        dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['E_exact'] = E_exact
+        try:
+            EIGVAL, _ = scipy.sparse.linalg.eigs(H_active.get_matrix(sparse=True))
+            E_exact = np.min(np.real(EIGVAL))
+            dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['E_exact'] = E_exact
+        except Exception as e_print_sparse:
+            print(f'Exception (sparse diag) : {e_print_sparse}')
+            dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['E_exact'] = None
     else:
         dic_H_save[str(l1)][mol.basis][str(nb_homo)][str(nb_lumo)]['E_exact'] = None
-        
+    
+    ########
+    # 6 : Save the dictionnary into save_filename.H.pickle
+    ########
     with open(f'{save_filename}.H.pickle','wb') as f2:
         pickle.dump(dic_H_save,f2)
         print(f'=> The dictionary of results is saved in {save_filename}.H.pickle')
 
-    return dic_H_save
-
+    return dic_H_save    
+    
 ##############################
 ### Distortions of benzene ###
 ##############################
@@ -287,4 +386,3 @@ def full_hamilt_computation(dist, alpha, basis, nb_homo, nb_lumo, calc_E_exact =
     
     
     
-
