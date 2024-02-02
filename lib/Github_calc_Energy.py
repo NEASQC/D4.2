@@ -4,11 +4,15 @@
 import numpy as np
 import pickle
 import scipy.optimize
-import qat.dqs.qchem.pyscf_tools as pyscf
 from pyscf import gto, scf
-from qat.dqs.transforms import transform_to_jw_basis, get_jw_code, recode_integer
-from qat.dqs.qchem.ucc import get_cluster_ops_and_init_guess, build_ucc_ansatz
-from qat.lang.AQASM import H, RX, RY, CNOT, QRoutine, Program
+
+from qat.lang.AQASM import H, RX, RY, CNOT, QRoutine, Program, X
+from qat.fermion.chemistry.ucc_deprecated import get_cluster_ops_and_init_guess
+from qat.fermion.chemistry.ucc import tobin
+
+from qat.fermion.transforms import transform_to_jw_basis, get_jw_code, recode_integer
+from qat.fermion.trotterisation import make_spin_hamiltonian_trotter_slice
+
 from qat.qpus import LinAlg
 
 #################
@@ -142,7 +146,25 @@ def ucc_ansatz_calc(H_active, active_inds, occ_inds, noons, orbital_energies, ne
     # 4 : creation of the qUCC ansatz
     ########
     
-    qprog = build_ucc_ansatz(cluster_ops_sp, hf_init_sp)
+    def build_qprog(theta):
+    
+        ## Preparation of |HF> ##
+        ket_hf_init_sp = [int(c) for c in tobin(hf_init_sp, H_active_sp.nbqbits)]
+        QPROG_exp = QRoutine(arity=H_active_sp.nbqbits)
+        for j in range(H_active_sp.nbqbits):
+            if int(ket_hf_init_sp[j]) == 1:
+                QPROG_exp.apply(X, j)
+
+        ## Implement \prod_{i} exp(A_i*theta_i) to |HF> ##
+        reg2 = list(range(H_active_sp.nbqbits))
+        for n_term, (term, theta_term) in enumerate(zip(cluster_ops_sp, theta)):
+            if type(theta_term) == list:
+                theta_term = theta_term[0]
+            op_exp = make_spin_hamiltonian_trotter_slice(term, coeff=float(theta_term))
+            QPROG_exp.apply(op_exp, reg2[: op_exp.arity])
+        return QPROG_exp
+    
+    qprog = build_qprog
 
     return H_active_sp, qprog, theta_0
 
