@@ -2,7 +2,7 @@
 # coding: utf-8
 
 import sys
-sys.path.insert(1,'../lib')
+sys.path.insert(1,'D4.2/lib')
 from lib.Github_calc_Hamilt import save_H_into_dict
 from lib.Github_calc_Energy import save_E_into_dict
 
