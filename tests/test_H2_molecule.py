@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from pyscf import gto, scf
-from .Github_calc_Hamilt import save_H_into_dict
-from .Github_calc_Energy import save_E_into_dict
+import sys
+sys.path.insert(1,'../lib')
+from lib.Github_calc_Hamilt import save_H_into_dict
+from lib.Github_calc_Energy import save_E_into_dict
 
+from pyscf import gto, scf
 import numpy as np
 
 def test_H2():
